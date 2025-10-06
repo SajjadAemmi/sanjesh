@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>Face Recognition (SCRFD + ArcFace) - Add New Person</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.23.0/ort.min.js"
+    integrity="sha512-A6Ot7qiW93XRv1tMX93Vhvlt1ysO/BMxx77BhipVszp9mByYfZ+2M+vo/ZLcTkGwkNO0J+atRybGXiiHy4yQ5Q=="
+    crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      text-align: center;
+      background: #f7f7f7;
+      padding: 20px;
+    }
+
+    video,
+    canvas {
+      width: 320px;
+      height: 240px;
+      border: 2px solid #555;
+      border-radius: 8px;
+      margin: 10px;
+    }
+
+    #buttons button {
+      margin: 6px;
+      padding: 10px 16px;
+      border: none;
+      background: #4a90e2;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    #buttons button:hover {
+      background: #357ab8;
+    }
+
+    #result {
+      font-size: 18px;
+      margin-top: 15px;
+      color: #333;
+    }
+
+    #addPersonDiv {
+      margin-top: 15px;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Face Recognition (SCRFD + ArcFace) - Browser Only</h2>
+
+  <!-- <video id="video" autoplay playsinline></video> -->
+  <video id="video" autoplay playsinline muted></video>
+  <br>
+  <canvas id="canvas"></canvas>
+
+  <div id="buttons">
+    <button id="startCam">Start Camera</button>
+    <button id="captureBtn">Capture Frame</button>
+    <button id="detectBtn">Detect Face</button>
+    <button id="recognizeBtn">Recognize</button>
+  </div>
+
+  <div id="addPersonDiv">
+    <input type="text" id="personName" placeholder="Enter name..." />
+    <button id="addPersonBtn">Add New Person</button>
+  </div>
+
+  <p id="result">Result: -</p>
+
+  <script>
+    let video = document.getElementById('video');
+    let canvas = document.getElementById('canvas');
+    let ctx = canvas.getContext('2d');
+    let scrfdSession, arcfaceSession;
+    let faceBox = null;
+    let faceEmbedding = null;
+
+    // --- Load Models ---
+    async function loadModels() {
+      scrfdSession = await ort.InferenceSession.create('./det_500m.onnx');
+      arcfaceSession = await ort.InferenceSession.create('./w600k_mbf.onnx');
+      console.log("Models loaded.");
+    }
+
+    // --- Start Camera ---
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+        document.getElementById('startCam').disabled = true;
+        console.log("Camera started automatically.");
+      } catch (err) {
+        console.error("Camera access denied:", err);
+        alert("Please allow camera access.");
+      }
+    }
+
+    document.getElementById('startCam').onclick = startCamera;
+
+    // --- Capture Frame ---
+    document.getElementById('captureBtn').onclick = () => {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    };
+
+    // --- Detect Face ---
+    document.getElementById('detectBtn').onclick = async () => {
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const inputTensor = preprocessSCRFD(imageData);
+      const feeds = {};
+      feeds[scrfdSession.inputNames[0]] = inputTensor;
+      const output = await scrfdSession.run(feeds);
+
+      faceBox = postprocessSCRFD(output, canvas.width, canvas.height);
+      if (faceBox) {
+        drawBox(faceBox);
+        document.getElementById('result').textContent = 'Face detected!';
+      } else {
+        document.getElementById('result').textContent = 'No face detected.';
+      }
+    };
+
+    // --- Recognize Face ---
+    document.getElementById('recognizeBtn').onclick = async () => {
+      if (!faceBox) return alert('No face detected!');
+      const faceTensor = preprocessArcFace(faceBox);
+      const feeds = {};
+      feeds[arcfaceSession.inputNames[0]] = faceTensor;
+      const output = await arcfaceSession.run(feeds);
+      faceEmbedding = output[arcfaceSession.outputNames[0]].data;
+
+      const known = loadDatabase();
+      if (known.length === 0) {
+        document.getElementById('result').textContent = 'No registered faces yet.';
+        return;
+      }
+
+      const name = findClosestPerson(faceEmbedding, known);
+      document.getElementById('result').textContent = 'Recognized: ' + name;
+    };
+
+    // --- Add New Person ---
+    document.getElementById('addPersonBtn').onclick = () => {
+      if (!faceEmbedding) return alert('Run recognition first to get embedding!');
+      const name = document.getElementById('personName').value.trim();
+      if (!name) return alert('Enter a name first.');
+
+      const known = loadDatabase();
+      known.push({ name: name, embedding: Array.from(faceEmbedding) });
+      localStorage.setItem('faceDB', JSON.stringify(known));
+
+      document.getElementById('result').textContent = 'Added new person: ' + name;
+      document.getElementById('personName').value = '';
+    };
+
+    // --- Helpers ---
+    function preprocessSCRFD(imageData) {
+      const { data, width, height } = imageData;
+      const resized = new Float32Array(1 * 3 * height * width);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = (y * width + x) * 4;
+          const r = data[i], g = data[i + 1], b = data[i + 2];
+          const j = y * width + x;
+          resized[j] = r / 255;
+          resized[j + width * height] = g / 255;
+          resized[j + 2 * width * height] = b / 255;
+        }
+      }
+      return new ort.Tensor('float32', resized, [1, 3, height, width]);
+    }
+
+    function postprocessSCRFD(output, width, height) {
+      // Mock box for now — replace with actual SCRFD decoding later
+      return { x: 80, y: 60, w: 160, h: 160 };
+    }
+
+    function drawBox(box) {
+      ctx.strokeStyle = 'red';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(box.x, box.y, box.w, box.h);
+    }
+
+    function preprocessArcFace(box) {
+      const off = document.createElement('canvas');
+      off.width = 112;
+      off.height = 112;
+      const offCtx = off.getContext('2d');
+      offCtx.drawImage(canvas, box.x, box.y, box.w, box.h, 0, 0, 112, 112);
+      const imgData = offCtx.getImageData(0, 0, 112, 112);
+      const data = imgData.data;
+      const input = new Float32Array(1 * 3 * 112 * 112);
+      for (let y = 0; y < 112; y++) {
+        for (let x = 0; x < 112; x++) {
+          const i = (y * 112 + x) * 4;
+          const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
+          const j = y * 112 + x;
+          input[j] = r;
+          input[j + 112 * 112] = g;
+          input[j + 2 * 112 * 112] = b;
+        }
+      }
+      return new ort.Tensor('float32', input, [1, 3, 112, 112]);
+    }
+
+    function loadDatabase() {
+      const data = localStorage.getItem('faceDB');
+      return data ? JSON.parse(data) : [];
+    }
+
+    function cosineSimilarity(a, b) {
+      let dot = 0, na = 0, nb = 0;
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+      }
+      return dot / (Math.sqrt(na) * Math.sqrt(nb));
+    }
+
+    function findClosestPerson(embedding, db) {
+      let maxSim = -1;
+      let best = "Unknown";
+      for (const p of db) {
+        const sim = cosineSimilarity(embedding, p.embedding);
+        if (sim > maxSim) {
+          maxSim = sim;
+          best = p.name;
+        }
+      }
+      return best + ` (sim=${maxSim.toFixed(2)})`;
+    }
+
+    // --- Initialize on Page Load ---
+    window.onload = async () => {
+      await loadModels();
+      // await startCamera();
+      // document.getElementById('result').textContent = 'Ready - camera active.';
+    };
+
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+        const video = document.getElementById('video');
+        video.srcObject = stream;
+        await video.play();
+        console.log('Camera started.');
+      } catch (err) {
+        alert('Please allow camera access.');
+        console.error('Camera error:', err);
+      }
+    }
+
+    startCamera();
+  </script>
+</body>
+
+</html>
